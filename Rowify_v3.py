@@ -305,7 +305,7 @@ if uploaded:
 
         # --- DOWNLOAD AS EXCEL ---
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        with pd.ExcelWriter(output) as writer:
             df_filtered.to_excel(writer, index=False, sheet_name="Parsed Data")
         
         st.download_button(
