@@ -3,6 +3,7 @@ import pandas as pd
 import re
 from datetime import datetime
 import altair as alt
+import io
 
 # ------------------------------------------------------------
 # PAGE CONFIG + HEADER
