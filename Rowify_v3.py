@@ -9,11 +9,11 @@ import altair as alt
 # ------------------------------------------------------------
 
 st.set_page_config(
-    page_title="🌼 WhatsApp Data Parser — Final Edition",
+    page_title="🌼 WhatsApp Data Parser",
     layout="wide"
 )
 
-st.title("🌼 WhatsApp Data Parser — Final Edition")
+st.title("🌼 WhatsApp Data Parser")
 
 st.markdown("""
 <div style="
@@ -120,7 +120,7 @@ def is_notice(msg_norm):
     return msg_norm.startswith(("OMITTED", "MEDIA", "THIS MESSAGE WAS DELETED", "EDITED"))
 
 # ------------------------------------------------------------
-# PERSON PARSING (FINAL LOGIC)
+# PERSON PARSING
 # ------------------------------------------------------------
 
 def parse_people_from_message(msg):
