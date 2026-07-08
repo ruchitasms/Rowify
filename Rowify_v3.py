@@ -3,7 +3,6 @@ import pandas as pd
 import re
 from datetime import datetime
 import altair as alt
-import io
 
 # ------------------------------------------------------------
 # PAGE CONFIG + HEADER
@@ -302,18 +301,6 @@ if uploaded:
 
         st.subheader("Parsed Data")
         st.dataframe(df_filtered, use_container_width=True)
-
-        # --- DOWNLOAD AS EXCEL ---
-        output = io.BytesIO()
-        with pd.ExcelWriter(output) as writer:
-            df_filtered.to_excel(writer, index=False, sheet_name="Parsed Data")
-        
-        st.download_button(
-            label="📥 Download as Excel",
-            data=output.getvalue(),
-            file_name="parsed_whatsapp_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
 
         df_filtered["Age Group"] = df_filtered["Age"].apply(age_group)
 
