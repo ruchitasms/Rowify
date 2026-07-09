@@ -1,320 +1,263 @@
-import streamlit as st
-import pandas as pd
 import re
+import io
 from datetime import datetime
-import altair as alt
 
-# ------------------------------------------------------------
-# PAGE CONFIG + HEADER
-# ------------------------------------------------------------
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="🌼 WhatsApp Data Parser",
-    layout="wide"
-)
+# -----------------------------
+# Helpers: WhatsApp parsing
+# -----------------------------
 
-st.title("🌼 WhatsApp Data Parser")
-
-st.markdown("""
-<div style="
-    padding: 15px;
-    border-radius: 10px;
-    background-color: #e8f5e9;
-    border-left: 6px solid #66BB6A;
-    font-size: 16px;
-    margin-bottom: 20px;
-">
-<b>🔒 Your Data Is Safe</b><br>
-This tool processes your WhatsApp messages <i>only on your device</i>.
-Nothing is stored, uploaded, or shared.
-</div>
-""", unsafe_allow_html=True)
-
-# ------------------------------------------------------------
-# TIMESTAMP PARSING + MERGING
-# ------------------------------------------------------------
-
-TS_PATTERN = r"^\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}"
-
-TS_FORMATS = [
-    "%d/%m/%y, %H:%M",
-    "%d/%m/%Y, %H:%M",
-    "%d/%m/%y, %I:%M %p",
-    "%d/%m/%Y, %I:%M %p",
-]
-
-def parse_ts(ts_str):
-    for fmt in TS_FORMATS:
-        try:
-            return datetime.strptime(ts_str, fmt)
-        except:
-            continue
-    return None
+TIMESTAMP_PATTERN = r"^(\d{1,2}/\d{1,2}/\d{2,4}), (\d{1,2}:\d{2} (?:AM|PM)) - "
 
 def parse_whatsapp_line(line):
-    if re.match(TS_PATTERN, line):
-        try:
-            ts_part, rest = line.split(" - ", 1)
-            sender, msg = rest.split(": ", 1)
-            return ts_part.strip(), sender.strip(), msg.strip()
-        except:
-            return None, None, None
-    return None, None, None
+    """
+    Parse a single WhatsApp line into timestamp, sender, message.
+    Assumes standard export format: "DD/MM/YY, HH:MM - Sender: Message"
+    """
+    m = re.match(TIMESTAMP_PATTERN, line)
+    if not m:
+        return None, None, line.strip()
 
-def merge_messages(lines):
-    merged = []
-    current_ts = None
-    current_sender = None
-    current_msg = []
+    ts_str = m.group(0)[:-3]  # "DD/MM/YY, HH:MM AM/PM -"
+    rest = line[len(m.group(0)):]
+    # Split sender and message
+    if ": " in rest:
+        sender, message = rest.split(": ", 1)
+    else:
+        sender, message = None, rest
 
-    for line in lines:
-        ts_str, sender, msg = parse_whatsapp_line(line)
-        if ts_str and sender and msg:
-            if current_ts is not None:
-                merged.append((current_ts, current_sender, " ".join(current_msg)))
-            current_ts = ts_str
-            current_sender = sender
-            current_msg = [msg]
-        else:
-            if current_ts is not None and line.strip():
-                current_msg.append(line.strip())
+    # Try to parse timestamp
+    try:
+        timestamp = datetime.strptime(ts_str.replace(" -", ""), "%d/%m/%y, %I:%M %p")
+    except Exception:
+        timestamp = ts_str.replace(" -", "")
 
-    if current_ts is not None:
-        merged.append((current_ts, current_sender, " ".join(current_msg)))
+    return timestamp, sender, message.strip()
 
-    return merged
 
-# ------------------------------------------------------------
-# NORMALIZATION + TOKEN RULES
-# ------------------------------------------------------------
+# -----------------------------
+# Helpers: Token parsing engine
+# -----------------------------
 
-PREF_WORDS = {"VEG", "NONVEG", "VEGAN", "VEGETARIAN", "D", "ND"}
-NOTICE_WORDS = {"MESSAGE", "WAS", "DELETED", "EDITED", "MEDIA", "OMITTED"}
+def clean_token(token):
+    # Remove punctuation, keep letters/digits/underscore
+    cleaned = re.sub(r"[^\w]", "", token)
+    return cleaned.strip()
 
-def normalize_text(text):
-    return text.upper().strip()
+def tokenize_message(message):
+    """
+    Split message into tokens, clean punctuation, drop empties.
+    """
+    raw_tokens = message.split()
+    tokens = []
+    for t in raw_tokens:
+        c = clean_token(t)
+        if c:
+            tokens.append(c)
+    return tokens
 
-def tokenize(text):
-    return [t for t in text.split() if t]
+def build_dynamic_columns(tokens):
+    """
+    Map tokens to dynamic columns: Col1, Col2, ...
+    Each token becomes its own column (fully dynamic).
+    """
+    data = {}
+    for i, tok in enumerate(tokens, start=1):
+        col_name = f"Col{i}"
+        data[col_name] = tok
+    return data
 
-def is_alpha_word(token):
-    return re.fullmatch(r"[A-Z]+", token) is not None
+def parse_message_row(timestamp, sender, message):
+    """
+    Build a single parsed row dict:
+    Sender, Timestamp, Raw Message, then dynamic Col1..ColN.
+    """
+    tokens = tokenize_message(message)
+    cols = build_dynamic_columns(tokens)
 
-def extract_age_from_token(token):
-    m = re.search(r"\d+", token)
-    if m:
-        num = int(m.group())
-        if 1 <= num <= 120:
-            return num
-    return None
-
-def is_pref_token(token):
-    if token in PREF_WORDS:
-        return True
-    return bool(re.search(r"[A-Z]", token) and re.search(r"[-_,;:]", token))
-
-def is_blood_group(token):
-    return re.fullmatch(r"(A|B|AB|O)[+-]", token) is not None
-
-def is_notice(msg_norm):
-    return msg_norm.startswith(("OMITTED", "MEDIA", "THIS MESSAGE WAS DELETED", "EDITED"))
-
-# ------------------------------------------------------------
-# PERSON PARSING
-# ------------------------------------------------------------
-
-def parse_people_from_message(msg):
-    msg_norm = normalize_text(msg)
-    if is_notice(msg_norm):
-        return []
-
-    tokens = tokenize(msg_norm)
-
-    people = []
-    current = {
-        "name_tokens": [],
-        "age": None,
-        "pref_tokens": [],
-        "other_tokens": []
+    row = {
+        "Sender": sender,
+        "Timestamp": timestamp,
+        "Raw Message": message,
     }
+    row.update(cols)
+    return row
 
-    skip_total_number = False
 
-    def finalize_current():
-        if current["name_tokens"]:
-            people.append({
-                "Name": " ".join(current["name_tokens"]),
-                "Age": current["age"],
-                "Preference": " ".join(current["pref_tokens"]) if current["pref_tokens"] else None,
-                "Other": " ".join(current["other_tokens"]) if current["other_tokens"] else None
-            })
+# -----------------------------
+# Analytics engine
+# -----------------------------
 
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
+def is_numeric_series(s):
+    try:
+        pd.to_numeric(s.dropna())
+        return True
+    except Exception:
+        return False
 
-        # SYSTEM NOTICE WORDS INSIDE MESSAGE
-        if tok in NOTICE_WORDS:
-            current["other_tokens"].append(tok)
-            i += 1
+def pick_categorical_columns(df, max_charts=3, min_unique=2, max_unique=5):
+    """
+    Pick up to max_charts columns that:
+    - are non-numeric
+    - have unique values between min_unique and max_unique
+    """
+    candidates = []
+    for col in df.columns:
+        if col in ["Sender", "Timestamp", "Raw Message"]:
             continue
-
-        # TOTAL handling
-        if tok.startswith("TOTAL"):
-            skip_total_number = True
-            i += 1
+        series = df[col].dropna().astype(str)
+        if series.empty:
             continue
-
-        # AGE detection (even inside punctuation)
-        age_val = extract_age_from_token(tok)
-        if age_val is not None:
-            if skip_total_number:
-                skip_total_number = False
-                i += 1
-                continue
-            if current["age"] is None:
-                current["age"] = age_val
-            else:
-                current["other_tokens"].append(tok)
-            i += 1
+        if is_numeric_series(series):
             continue
+        uniques = series.unique()
+        if min_unique <= len(uniques) <= max_unique:
+            candidates.append(col)
+    return candidates[:max_charts]
 
-        # SINGLE LETTER AFTER AGE/PREF → preference, not name
-        if len(tok) == 1 and (current["age"] is not None or current["pref_tokens"]):
-            current["pref_tokens"].append(tok)
-            i += 1
+def build_analytics_summary(df, cat_cols):
+    """
+    Create a small textual summary of what was identified.
+    """
+    lines = []
+    if not cat_cols:
+        return "No suitable categorical columns (with 2–5 unique values) were detected for analytics."
+
+    lines.append(f"Detected {len(cat_cols)} categorical field(s): " + ", ".join(cat_cols) + ".")
+    for col in cat_cols:
+        series = df[col].dropna().astype(str)
+        vc = series.value_counts()
+        total = vc.sum()
+        top = vc.index[0]
+        pct = round(vc.iloc[0] / total * 100, 1)
+        lines.append(f"- In **{col}**, '{top}' appears most often ({vc.iloc[0]} rows, {pct}%).")
+    return "\n".join(lines)
+
+
+# -----------------------------
+# Excel export
+# -----------------------------
+
+def build_excel_file(parsed_df, cat_cols):
+    """
+    Create an Excel file in memory with:
+    - Sheet1: Parsed data
+    - Sheet2: Analytics summary
+    - Sheet3: Category counts (tables)
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Sheet 1: Parsed data
+        parsed_df.to_excel(writer, sheet_name="Parsed Data", index=False)
+
+        # Sheet 2: Analytics summary
+        summary_rows = []
+        if cat_cols:
+            for col in cat_cols:
+                series = parsed_df[col].dropna().astype(str)
+                vc = series.value_counts().reset_index()
+                vc.columns = [col, "Count"]
+                vc["Share (%)"] = (vc["Count"] / vc["Count"].sum() * 100).round(1)
+                vc["Field"] = col
+                summary_rows.append(vc)
+            summary_df = pd.concat(summary_rows, ignore_index=True)
+        else:
+            summary_df = pd.DataFrame({"Info": ["No categorical columns detected."]})
+
+        summary_df.to_excel(writer, sheet_name="Analytics Summary", index=False)
+
+        # Sheet 3: Raw counts per categorical column (optional)
+        if cat_cols:
+            counts_sheets = []
+            for col in cat_cols:
+                series = parsed_df[col].dropna().astype(str)
+                vc = series.value_counts().reset_index()
+                vc.columns = [col, "Count"]
+                counts_sheets.append((col, vc))
+            # Put them one after another in a single sheet
+            start_row = 0
+            sheet_name = "Category Counts"
+            for col, vc in counts_sheets:
+                vc.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
+                start_row += len(vc) + 2
+
+    output.seek(0)
+    return output
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+
+def main():
+    st.set_page_config(page_title="Rowify", layout="wide")
+    st.title("Rowify – WhatsApp Row Parser")
+
+    st.markdown("Upload a WhatsApp chat `.txt` export and I’ll parse it into dynamic columns, "
+                "then show a small analytics summary and let you download everything as Excel.")
+
+    uploaded_file = st.file_uploader("Upload WhatsApp chat (.txt)", type=["txt"])
+
+    if not uploaded_file:
+        st.info("Please upload a WhatsApp chat export to begin.")
+        return
+
+    # Read lines
+    text = uploaded_file.read().decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+
+    parsed_rows = []
+    for line in lines:
+        ts, sender, msg = parse_whatsapp_line(line)
+        # Skip system messages or empty
+        if msg is None or msg.strip() == "":
             continue
+        row = parse_message_row(ts, sender, msg)
+        parsed_rows.append(row)
 
-        # NAME DETECTION (supports middle initials)
-        if is_alpha_word(tok) and tok not in PREF_WORDS:
+    if not parsed_rows:
+        st.warning("No parsable messages were found. Please check the format of your WhatsApp export.")
+        return
 
-            # STOP name chain if age or preference already found
-            if current["age"] is not None or current["pref_tokens"]:
-                finalize_current()
-                current = {
-                    "name_tokens": [tok],
-                    "age": None,
-                    "pref_tokens": [],
-                    "other_tokens": []
-                }
-                i += 1
-                continue
+    df = pd.DataFrame(parsed_rows)
 
-            # Single-letter middle initial allowed ONLY inside name chain
-            if len(tok) == 1:
-                if current["name_tokens"]:
-                    current["name_tokens"].append(tok)
-                else:
-                    current["other_tokens"].append(tok)
-                i += 1
-                continue
+    st.subheader("Parsed Table")
+    st.dataframe(df, use_container_width=True)
 
-            # Normal name word
-            current["name_tokens"].append(tok)
-            i += 1
-            continue
+    # Analytics
+    st.subheader("Analytics")
+    cat_cols = pick_categorical_columns(df)
+    summary_text = build_analytics_summary(df, cat_cols)
+    st.markdown(summary_text)
 
-        # PREFERENCE
-        if is_pref_token(tok):
-            current["pref_tokens"].append(tok)
-            i += 1
-            continue
+    # Charts
+    if cat_cols:
+        st.markdown("### Charts")
+        for col in cat_cols:
+            series = df[col].dropna().astype(str)
+            vc = series.value_counts()
+            fig, ax = plt.subplots()
+            vc.plot(kind="bar", ax=ax)
+            ax.set_title(f"Distribution of {col}")
+            ax.set_xlabel(col)
+            ax.set_ylabel("Count")
+            st.pyplot(fig)
+    else:
+        st.info("No charts generated because no suitable categorical columns were found.")
 
-        # BLOOD GROUP → Other
-        if is_blood_group(tok):
-            current["other_tokens"].append(tok)
-            i += 1
-            continue
+    # Excel download
+    st.subheader("Download as Excel")
+    excel_bytes = build_excel_file(df, cat_cols)
+    st.download_button(
+        label="Download Excel file",
+        data=excel_bytes,
+        file_name="rowify_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-        # ANYTHING ELSE → Other
-        current["other_tokens"].append(tok)
-        i += 1
 
-    finalize_current()
-    return people
-
-# ------------------------------------------------------------
-# AGE GROUP
-# ------------------------------------------------------------
-
-def age_group(age):
-    if age is None:
-        return None
-    if age <= 12:
-        return "0–12"
-    if age <= 19:
-        return "13–19"
-    if age <= 40:
-        return "20–40"
-    if age <= 60:
-        return "41–60"
-    return "60+"
-
-# ------------------------------------------------------------
-# STREAMLIT UI
-# ------------------------------------------------------------
-
-uploaded = st.file_uploader("Upload WhatsApp .txt file", type=["txt"])
-
-if uploaded:
-    raw_lines = uploaded.read().decode("utf-8", errors="ignore").split("\n")
-    merged = merge_messages(raw_lines)
-
-    rows = []
-    timestamps = []
-
-    for ts_str, sender, msg in merged:
-        dt = parse_ts(ts_str)
-        if not dt:
-            continue
-        timestamps.append(dt)
-
-        people = parse_people_from_message(msg)
-        for p in people:
-            rows.append({
-                "Sender": sender,
-                "Timestamp": dt,
-                "Raw Message": msg,
-                "Name": p["Name"],
-                "Age": p["Age"],
-                "Preference": p["Preference"],
-                "Other": p["Other"]
-            })
-
-    if rows:
-        df = pd.DataFrame(rows)
-
-        st.subheader("Select Date & Time Range")
-        col1, col2 = st.columns(2)
-
-        start_date = col1.date_input("Start Date", min(timestamps))
-        start_time = col1.time_input("Start Time", min(timestamps).time())
-
-        end_date = col2.date_input("End Date", max(timestamps))
-        end_time = col2.time_input("End Time", max(timestamps).time())
-
-        start_dt = datetime.combine(start_date, start_time)
-        end_dt = datetime.combine(end_date, end_time)
-
-        mask = (df["Timestamp"] >= start_dt) & (df["Timestamp"] <= end_dt)
-        df_filtered = df[mask].copy()
-
-        st.subheader("Parsed Data")
-        st.dataframe(df_filtered, use_container_width=True)
-
-        df_filtered["Age Group"] = df_filtered["Age"].apply(age_group)
-
-        st.subheader("Age Group Summary")
-        age_counts = df_filtered["Age Group"].value_counts().reset_index()
-        age_counts.columns = ["Age Group", "Count"]
-
-        chart = alt.Chart(age_counts).mark_bar(
-            cornerRadiusTopLeft=6,
-            cornerRadiusTopRight=6
-        ).encode(
-            x="Age Group:N",
-            y="Count:Q",
-            color=alt.value("#A5D6A7")
-        )
-
-        st.altair_chart(chart, use_container_width=True)
+if __name__ == "__main__":
+    main()
