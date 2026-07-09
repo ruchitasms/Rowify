@@ -1,4 +1,4 @@
 streamlit
 pandas
+altair
 openpyxl
-matplotlib
